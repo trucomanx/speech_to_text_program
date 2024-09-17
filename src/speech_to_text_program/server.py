@@ -1,134 +1,157 @@
-import numpy as np
-import pyaudio
-import wave
 import os
-from collections import deque
+import time
+import wave
+import pyaudio
+import threading
 from flask import Flask, jsonify
+from collections import deque
+import tempfile
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Configurações
-THRESHOLD_RATIO_START = 1.5  # Fator para iniciar a gravação com base no ruído
-THRESHOLD_RATIO_STOP = 1.2   # Fator para parar a gravação com base no ruído
-MAX_STACK_SIZE = 67          # Tamanho máximo da stack FIFO
-SAMPLE_RATE = 44100          # Taxa de amostragem (Hz)
-DURATION = 0.1               # Duração de cada gravação em segundos (100ms)
-PRE_RECORDING_SECONDS = 3    # Tempo para gravação inicial (pré-determinação de ruído)
-CHUNK_SIZE = int(SAMPLE_RATE * DURATION)  # Tamanho do chunk de áudio
-FORMAT = pyaudio.paInt16     # Formato do áudio
-CHANNELS = 1                 # Canal mono
+# Configurações de áudio
+SAMPLE_RATE = 44100
+CHUNK_SIZE = 4096
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
 
-# Stack de áudio
+# Stack FIFO para armazenar os áudios
+MAX_STACK_SIZE = 67
 audio_stack = deque(maxlen=MAX_STACK_SIZE)
 
-# Inicializar PyAudio
-p = pyaudio.PyAudio()
+# Variáveis globais para os limites de gravação
+start_threshold = 0
+stop_threshold = 0
 
-# Função para calcular o valor RMS em float32
-def calculate_rms(audio_data):
-    """Calcula o valor RMS do áudio com valores em float32."""
-    if len(audio_data) == 0:
-        return 0
-    audio_data = audio_data.astype(np.float32)
-    return np.sqrt(np.mean(np.square(audio_data)))
+# Mutex para controlar o acesso à stack de áudio
+stack_mutex = threading.Lock()
 
-# Grava o áudio e retorna os dados
-def record_audio(duration):
-    """Grava áudio por uma duração especificada e retorna como float32."""
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=SAMPLE_RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK_SIZE)
+def get_average_noise_level(audio_data):
+    """Calcula o nível médio de som (valor absoluto médio)."""
+    return sum(abs(x) for x in audio_data) / len(audio_data)
 
-    frames = []
-    for _ in range(0, int(SAMPLE_RATE / CHUNK_SIZE * duration)):
-        data = stream.read(CHUNK_SIZE)
-        frames.append(np.frombuffer(data, dtype=np.int16).astype(np.float32))  # Convertendo para float32
+def record_environment_noise(stream):
+    """Grava 3.7 segundos de áudio ambiente para medir o nível de ruído."""
+    
+    # Inicializa e descarta alguns blocos para estabilizar o microfone
 
+    last1_noise_level=1;
+    current_noise_level=1;
+    for k in range(20): 
+        last2_noise_level=last1_noise_level;
+        last1_noise_level=current_noise_level;
+        
+        noise_data = 0.0;
+        L=int(SAMPLE_RATE / CHUNK_SIZE * 1.5);
+        for _ in range(L):
+            block = stream.read(CHUNK_SIZE)
+            audio_data = wave.struct.unpack("%dh" % CHUNK_SIZE, block)
+            val=get_average_noise_level(audio_data);
+            noise_data+=val;
+        
+        current_noise_level=noise_data/L;
+        
+        mean_noise_level=(current_noise_level+last1_noise_level+last2_noise_level)/3.0;
+        mean_diff_noise_level=0.5*abs(current_noise_level-last1_noise_level)+0.5*abs(last1_noise_level-last2_noise_level);
+        factor=mean_diff_noise_level/mean_noise_level;
+        
+        print('Noise level in test',k,':',current_noise_level,'factor:',factor)
+        if  factor<0.05:
+            break;
+    
+    return current_noise_level;
+
+def record_audio():
+    """Função principal de gravação de áudio em loop."""
+    global start_threshold, stop_threshold
+
+    p = pyaudio.PyAudio()
+    
+    # Gravação inicial para medir o ruído ambiente
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE)
     stream.stop_stream()
     stream.close()
 
-    return np.concatenate(frames)
 
-# Função para gravar o áudio em um arquivo .wav
-def save_audio_to_wav(audio_data, filepath):
-    """Salva o áudio em formato WAV (float32)."""
-    with wave.open(filepath, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(4)  # 4 bytes para float32
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.astype(np.float32).tobytes())
 
-@app.route('/current_size', methods=['GET'])
-def get_current_size():
-    """Retorna o tamanho atual da stack."""
-    return jsonify({"current_size": len(audio_stack)})
+    # Inicializa o fluxo de áudio principal
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE)
 
-@app.route('/maximum_size', methods=['GET'])
-def get_maximum_size():
-    """Retorna o tamanho máximo da stack."""
-    return jsonify({"maximum_size": MAX_STACK_SIZE})
+    noise_level = record_environment_noise(stream)
+    start_threshold = 1.5 * noise_level
+    stop_threshold = 1.5 * noise_level
+    
+    print(f"Ruído ambiente: {noise_level}, Limiar início: {start_threshold}, Limiar fim: {stop_threshold}")
 
-@app.route('/last_data', methods=['GET'])
-def get_last_data():
-    """Retorna o último dado da stack (tupla com tempo e caminho do arquivo)."""
-    if len(audio_stack) > 0:
-        last_item = audio_stack[-1]
-        return jsonify({"init_time": last_item[0], "audio_filepath": last_item[1]})
-    return jsonify({"error": "No audio data available"})
-
-def measure_noise_level():
-    """Mede o nível de ruído inicial para definir os thresholds de gravação."""
-    print("Medindo nível de ruído inicial...")
-    pre_noise_audio = record_audio(PRE_RECORDING_SECONDS)
-    noise_rms = calculate_rms(pre_noise_audio)
-    threshold_start = noise_rms * THRESHOLD_RATIO_START
-    threshold_stop = noise_rms * THRESHOLD_RATIO_STOP
-    print(f"Nível de ruído RMS: {noise_rms:.4f}")
-    print(f"Threshold de início: {threshold_start:.4f}, Threshold de fim: {threshold_stop:.4f}")
-    return threshold_start, threshold_stop
-
-def run_audio_recording(threshold_start, threshold_stop):
-    """Executa o loop de gravação contínua, armazenando o áudio na stack FIFO."""
-    print("Iniciando a gravação de áudio...")
-    recording = False
-    temp_audio_data = []
 
     while True:
-        audio_chunk = record_audio(DURATION)
-        rms_value = calculate_rms(audio_chunk)
+        # Lê blocos de áudio em chunks
+        block = stream.read(CHUNK_SIZE)
+        audio_data = wave.struct.unpack("%dh" % CHUNK_SIZE, block)
+        sound_level = get_average_noise_level(audio_data)
         
-        if not recording and rms_value > threshold_start:
-            print("Iniciando gravação, som detectado!")
-            recording = True
-            temp_audio_data = [audio_chunk]
-        
-        elif recording and rms_value > threshold_stop:
-            temp_audio_data.append(audio_chunk)
-        
-        elif recording and rms_value <= threshold_stop:
-            print("Finalizando gravação...")
-            recording = False
-            
-            # Salvar o áudio em um arquivo temporário
-            audio_filepath = f"temp_audio_{len(audio_stack)}.wav"
-            audio_data = np.concatenate(temp_audio_data)
-            save_audio_to_wav(audio_data, audio_filepath)
-            
-            # Adicionar o caminho do arquivo e o tempo na stack FIFO
-            audio_stack.append((p.get_default_input_device_info()['defaultSampleRate'], audio_filepath))
-            temp_audio_data = []
+        if sound_level >= start_threshold:
+            print("Gravação iniciada...")
+            audio_frames = []
+            init_time = datetime.now()
 
-if __name__ == '__main__':
-    # Medir o nível de ruído inicial
-    threshold_start, threshold_stop = measure_noise_level()
+            while True:
+                audio_frames.append(block)
+                block = stream.read(CHUNK_SIZE)
+                audio_data = wave.struct.unpack("%dh" % CHUNK_SIZE, block)
+                sound_level = get_average_noise_level(audio_data)
 
-    # Iniciar o loop de gravação em um thread separado
-    from threading import Thread
-    recording_thread = Thread(target=run_audio_recording, args=(threshold_start, threshold_stop))
-    recording_thread.start()
+                if sound_level < stop_threshold:
+                    silent_time = 0
+                    while silent_time < 1.618:
+                        silent_time += CHUNK_SIZE / SAMPLE_RATE
+                        block = stream.read(CHUNK_SIZE)
+                        audio_frames.append(block)
+                        audio_data = wave.struct.unpack("%dh" % CHUNK_SIZE, block)
+                        sound_level = get_average_noise_level(audio_data)
+                        if sound_level >= stop_threshold:
+                            silent_time = 0
+                    break
 
-    # Iniciar o servidor Flask
+            # Cria o arquivo temporário .wav
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            wave_file = wave.open(temp_file.name, 'wb')
+            wave_file.setnchannels(CHANNELS)
+            wave_file.setsampwidth(p.get_sample_size(FORMAT))
+            wave_file.setframerate(SAMPLE_RATE)
+            wave_file.writeframes(b''.join(audio_frames))
+            wave_file.close()
+
+            with stack_mutex:
+                # Adiciona o caminho do arquivo e a hora de início à stack
+                if len(audio_stack) == MAX_STACK_SIZE:
+                    # Remove o arquivo mais antigo da stack
+                    oldest = audio_stack.popleft()
+                    if os.path.exists(oldest[1]):
+                        os.remove(oldest[1])
+                audio_stack.append((init_time, temp_file.name))
+                print(f"Áudio salvo: {temp_file.name}")
+
+@app.route('/current_size', methods=['GET'])
+def current_size():
+    with stack_mutex:
+        return jsonify({'current_size': len(audio_stack)})
+
+@app.route('/maximum_size', methods=['GET'])
+def maximum_size():
+    return jsonify({'maximum_size': MAX_STACK_SIZE})
+
+@app.route('/last_data', methods=['GET'])
+def last_data():
+    with stack_mutex:
+        if len(audio_stack) > 0:
+            last_item = audio_stack[-1]
+            return jsonify({'init_time': last_item[0].strftime('%Y-%m-%d %H:%M:%S'), 'audio_filepath': last_item[1]})
+        else:
+            return jsonify({'error': 'Stack is empty'})
+
+if __name__ == "__main__":
+    threading.Thread(target=record_audio).start()
     app.run(host='0.0.0.0', port=5555)
 
