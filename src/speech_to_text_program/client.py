@@ -1,40 +1,40 @@
-#!/usr/bin/python3
-
 import requests
 
+def get_current_size():
+    response = requests.get('http://localhost:5555/current_size')
+    if response.status_code == 200:
+        print("Tamanho atual da stack:", response.json()['current_size'])
+    else:
+        print("Erro ao obter o tamanho atual da stack.")
 
+def get_maximum_size():
+    response = requests.get('http://localhost:5555/maximum_size')
+    if response.status_code == 200:
+        print("Tamanho máximo da stack:", response.json()['maximum_size'])
+    else:
+        print("Erro ao obter o tamanho máximo da stack.")
 
-def send_request(base_url,endpoint):
-    try:
-        response = requests.get(f'{base_url}/{endpoint}')
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        return {'error': str(e)}
-
-def main():
-    # URL base do servidor
-    BASE_URL = 'http://localhost:5555'
-    
-    while True:
-        print("\nComandos disponíveis:")
-        print("1. Ver tamanho atual da pilha")
-        print("2. Ver tamanho máximo da pilha")
-        print("3. Ver último dado da pilha")
-        print("4. Sair")
-        choice = input("Escolha uma opção (1-4): ")
-
-        if choice == '1':
-            print(send_request(BASE_URL,'current_size'))
-        elif choice == '2':
-            print(send_request(BASE_URL,'maximum_size'))
-        elif choice == '3':
-            print(send_request(BASE_URL,'last_data'))
-        elif choice == '4':
-            break
+def get_last_data():
+    response = requests.get('http://localhost:5555/last_data')
+    if response.status_code == 200:
+        data = response.json()
+        if 'error' in data:
+            print("Erro:", data['error'])
         else:
-            print("Opção inválida. Tente novamente.")
+            print(f"Último dado - Início: {data['init_time']}, Arquivo de áudio: {data['audio_filepath']}")
+    else:
+        print("Erro ao obter o último dado da stack.")
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    print("Comandos disponíveis: current_size, maximum_size, last_data")
+    command = input("Digite o comando: ").strip()
+
+    if command == "current_size":
+        get_current_size()
+    elif command == "maximum_size":
+        get_maximum_size()
+    elif command == "last_data":
+        get_last_data()
+    else:
+        print("Comando inválido.")
 
